@@ -16,6 +16,10 @@ Checks (which run depends on the install type)
   resources     CPU saturation and memory of OSSEC daemons, system memory
   disk          space and inodes on the OSSEC partition
   config_test   each daemon's `-t` config test + verify-agent-conf (--validate-config)
+  uf_*          Splunk Universal Forwarder (skip with --no-splunk): splunkd running and
+                enabled at boot, connected to its indexers, queues not blocked or throttled
+                by maxKBps, alerts.log (or alerts.json) monitored in inputs.conf and readable
+                by the forwarder's user, and known trouble in splunkd.log
 
 Output
   default       readable report: problems first, each with a suggested next step,
@@ -35,8 +39,10 @@ Examples
 import argparse
 import collections
 import functools
+import grp
 import json
 import os
+import pwd
 import re
 import shutil
 import socket
@@ -45,7 +51,8 @@ import subprocess
 import sys
 import textwrap
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 OK, WARN, CRIT, UNKNOWN, SKIP = "OK", "WARNING", "CRITICAL", "UNKNOWN", "SKIPPED"
 RANK = {SKIP: -1, OK: 0, UNKNOWN: 1, WARN: 2, CRIT: 3}
@@ -64,6 +71,9 @@ TITLES = {
     "listener": "Agent listener", "connection": "Connection to server",
     "alerts": "Alert output", "ossec_log": "ossec.log errors", "resources": "CPU and memory",
     "disk": "Disk space", "config_test": "Config validation",
+    "uf_process": "Splunk forwarder", "uf_outputs": "Forwarding to Splunk",
+    "uf_queues": "Forwarder queues", "uf_input": "Forwarded file", "uf_log": "splunkd.log errors",
+    "uf_disk": "Forwarder disk space",
 }
 
 CORE_DAEMONS = {
@@ -212,7 +222,8 @@ def proc_stat(path):
         return None
     fields = raw[raw.rfind(")") + 2:].split()  # fields[0] is field 3 ("state") in proc(5)
     try:
-        return {"ticks": int(fields[11]) + int(fields[12]), "start": int(fields[19])}
+        return {"ticks": int(fields[11]) + int(fields[12]), "start": int(fields[19]),
+                "ppid": int(fields[1])}
     except (IndexError, ValueError):
         return None
 
@@ -290,7 +301,7 @@ def existing_parent(path):
     return path
 
 
-def check_disk(path, warn_pct, crit_pct, cleanup_advice):
+def check_disk(path, warn_pct, crit_pct, cleanup_advice, name="disk"):
     target = existing_parent(path)
     usage = shutil.disk_usage(target)
     denom = usage.used + usage.free
@@ -305,7 +316,7 @@ def check_disk(path, warn_pct, crit_pct, cleanup_advice):
             f.add(CRIT if pct >= crit_pct else WARN, issue, cleanup_advice)
     summary = "%.0f%% used, %s free, %.0f%% of inodes used (%s)" % (
         space_pct, fmt_bytes(usage.free), inode_pct, target)
-    return result("disk", f.status, summary, f.issues, f.advice, path=target,
+    return result(name, f.status, summary, f.issues, f.advice, path=target,
                   space_used_pct=round(space_pct, 1), free_bytes=usage.free,
                   inodes_used_pct=round(inode_pct, 1))
 
@@ -713,7 +724,7 @@ def check_ossec_log(ctx, args):
             f.advice.append("Check logs/ossec.log around those times for context.")
     for i, n in sorted(issues.items()):
         _, meaning, fix = KNOWN_ISSUES[i]
-        f.add(WARN, "%s (seen %s)." % (meaning, "once" if n == 1 else plural(n, "time")), fix)
+        f.add(WARN, "%s (seen %s)." % (meaning, times(n)), fix)
     top = sorted(grouped.values(), key=lambda e: -e[0])[:3]
     examples = ["(%dx) %s" % (count, text[:220]) for count, text in top]
     summary = "In the last %s: %d critical, %s, %s" % (
@@ -810,6 +821,646 @@ def check_config_test(ctx, args):
 
 
 # --------------------------------------------------------------------------- #
+# Splunk Universal Forwarder
+# This block is identical in snort_healthcheck.py and ossec_healthcheck.py.
+# --------------------------------------------------------------------------- #
+
+UF_UNITS = ("SplunkForwarder.service", "splunkforwarder.service", "Splunkd.service",
+            "splunk.service")
+SPLUNK_LOG_RE = re.compile(r"^(\d{2}-\d{2}-\d{4} \d{2}:\d{2}:\d{2})(?:\.\d+)? ([+-]\d{4})\s+(\w+)"
+                           r"\s+(\S+)(?:\s+\[[^\]]*\])?\s+-\s+(.*)$")
+METRIC_KV_RE = re.compile(r"(\w[\w.]*)=(\"[^\"]*\"|[^,]*)")
+CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH = 1 << 1, 1 << 2
+# (pattern matched against "Component message" of WARN/ERROR lines, what it means, what to do)
+UF_KNOWN_ISSUES = [
+    (re.compile(r"TcpOutputProc.*(blocked|paused the data flow)", re.I),
+     "Forwarding was blocked because the receiving indexers weren't accepting data",
+     "Check the indexers' health and queues and the network path; the TcpOutputProc lines in "
+     "splunkd.log name the destination."),
+    (re.compile(r"TcpOutput\w*.*(timed out|refused|failed|unable to connect|quarantine)", re.I),
+     "Connections to an indexer failed or timed out",
+     "Check the indexer is listening on its receiving port and that firewalls allow this host."),
+    (re.compile(r"(ssl|tls|certificate).*(error|fail|verify|alert)", re.I),
+     "There were TLS/certificate errors",
+     "Check the certificates and sslPassword in outputs.conf match what the indexers expect."),
+    (re.compile(r"insufficient permissions to read", re.I),
+     "splunkd couldn't read some monitored files",
+     "Give the forwarder's user read access (group membership or an ACL), then restart it."),
+    (re.compile(r"will not be read|seekptr checksum|crcsalt", re.I),
+     "Some files were skipped because their first bytes match a file Splunk already read",
+     "Add crcSalt = <SOURCE> (or a larger initCrcLength) to that monitor stanza."),
+    (re.compile(r"(DeploymentClient|DC:|Phonehome).*(unable|fail|error|timed out)", re.I),
+     "The forwarder couldn't phone home to its deployment server",
+     "Check targetUri in deploymentclient.conf and that the deployment server's port 8089 is "
+     "reachable."),
+    (re.compile(r"could not send data to output queue", re.I),
+     "Inputs stalled because the output queue was full",
+     "Same root cause as blocked forwarding - check the indexers and the connection to them."),
+]
+
+
+def conf_true(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "t", "y", "on")
+
+
+def parse_conf(path):
+    """{stanza: {key: value}} from one Splunk .conf file (keys before any stanza go to 'default')."""
+    out, stanza, pending = {}, "default", ""
+    try:
+        with open(path, "r", errors="replace") as fh:
+            raw_lines = fh.read().splitlines()
+    except OSError:
+        return out
+    for raw in raw_lines:
+        line = pending + raw
+        if line.endswith("\\"):                  # a trailing backslash continues the value
+            pending = line[:-1] + "\n"
+            continue
+        pending = ""
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        if text.startswith("[") and text.endswith("]"):
+            stanza = text[1:-1].strip()
+            out.setdefault(stanza, {})
+        elif "=" in text:
+            key, value = text.split("=", 1)
+            out.setdefault(stanza, {})[key.strip()] = value.strip()
+    return out
+
+
+def splunk_conf(home, name):
+    """Merged <name>.conf approximating btool's global precedence: system/local >
+    apps/*/local > apps/*/default > system/default, apps in ASCII order. Parsed directly
+    instead of calling `splunk btool`, so this never runs the Splunk CLI as root (which can
+    leave root-owned files behind that break a forwarder running as a normal user).
+    Returns (merged, {stanza: file it came from})."""
+    etc = os.path.join(home, "etc")
+    try:
+        apps = sorted(a for a in os.listdir(os.path.join(etc, "apps"))
+                      if os.path.isdir(os.path.join(etc, "apps", a)))
+    except OSError:
+        apps = []
+    layers = ([os.path.join(etc, "system", "local")]
+              + [os.path.join(etc, "apps", a, "local") for a in apps]
+              + [os.path.join(etc, "apps", a, "default") for a in apps]
+              + [os.path.join(etc, "system", "default")])
+    merged, origin = {}, {}
+    for layer in layers:
+        path = os.path.join(layer, name + ".conf")
+        for stanza, settings in parse_conf(path).items():
+            target = merged.setdefault(stanza, {})
+            for key, value in settings.items():
+                target.setdefault(key, value)
+            origin.setdefault(stanza, path)
+    return merged, origin
+
+
+def user_name(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except (KeyError, TypeError):
+        return str(uid)
+
+
+def group_name(gid):
+    try:
+        return grp.getgrgid(gid).gr_name
+    except (KeyError, TypeError):
+        return str(gid)
+
+
+def proc_fields(pid):
+    out = {}
+    for line in (read_text("/proc/%d/status" % pid) or "").splitlines():
+        key, _, value = line.partition(":")
+        out[key] = value.strip()
+    return out
+
+
+def span(seconds):
+    """'hour' for 3600, '15 minutes' for 900 - reads naturally after 'in the last'."""
+    text = fmt_duration(seconds)
+    return text[2:] if text.startswith("1 ") else text
+
+
+def times(n):
+    return "once" if n == 1 else "%s times" % "{:,}".format(n)
+
+
+def read_splunk_log(path, minutes, max_bytes=16 * 1024 * 1024):
+    """[(time, level, component, message)] from a splunkd-format log within the window,
+    oldest first, or None if the file can't be read."""
+    try:
+        lines = tail_lines(path, max_bytes)
+    except OSError:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    entries = []
+    for line in lines:
+        m = SPLUNK_LOG_RE.match(line)
+        if not m:
+            continue
+        try:
+            when = datetime.strptime("%s %s" % (m.group(1), m.group(2)), "%m-%d-%Y %H:%M:%S %z")
+        except ValueError:
+            continue
+        if when >= cutoff:
+            entries.append((when, m.group(3).upper(), m.group(4), m.group(5)))
+    return entries
+
+
+def discover_splunk(args):
+    pids = find_processes("splunkd")
+    exes = {}
+    for pid in pids:
+        try:
+            exes[pid] = os.readlink("/proc/%d/exe" % pid).replace(" (deleted)", "")
+        except OSError:
+            exes[pid] = ""
+    home = args.splunk_home
+    if not home:
+        homes = [os.path.dirname(os.path.dirname(e)) for e in exes.values() if e.endswith("/bin/splunkd")]
+        home = next((h for h in homes if "forwarder" in h.lower()), homes[0] if homes else None)
+    home = os.path.realpath(home or os.environ.get("SPLUNK_HOME") or "/opt/splunkforwarder")
+    pids = [p for p in pids if not exes[p] or exes[p].startswith(home + os.sep)]
+    # splunkd forks helper processes; the main one is the splunkd whose parent isn't splunkd
+    main = next((p for p in pids if (proc_stat("/proc/%d/stat" % p) or {}).get("ppid") not in pids),
+                pids[0] if pids else None)
+    uf = {"home": home, "installed": os.path.exists(os.path.join(home, "bin", "splunkd")),
+          "pids": pids, "main": main, "uid": None, "gids": set(), "user": "an unknown user",
+          "read_all": False, "unit": None, "unit_props": {},
+          "version": parse_conf(os.path.join(home, "etc", "splunk.version")).get("default", {}).get("VERSION"),
+          "product": ("Universal Forwarder" if os.path.isdir(os.path.join(home, "etc", "apps",
+                                                                          "SplunkUniversalForwarder"))
+                      else "Splunk"),
+          "deployment_server": None, "splunkd": None, "metrics": None}
+
+    if shutil.which("systemctl"):
+        for unit in UF_UNITS:
+            _, text, _ = run(["systemctl", "show", unit, "--no-pager", "--property=LoadState",
+                              "--property=ActiveState", "--property=UnitFileState",
+                              "--property=AmbientCapabilities"])
+            props = dict(line.partition("=")[::2] for line in text.splitlines())
+            if props.get("LoadState") == "loaded":
+                uf["unit"], uf["unit_props"] = unit, props
+                break
+
+    if main:
+        fields = proc_fields(main)
+        try:
+            uf["uid"] = int(fields["Uid"].split()[1])                 # effective uid
+            uf["gids"] = {int(fields["Gid"].split()[1])} | {int(g) for g in fields.get("Groups", "").split()}
+            # UF 9.x units often grant CAP_DAC_READ_SEARCH so a non-root forwarder can read any file
+            uf["read_all"] = bool(int(fields.get("CapEff", "0"), 16) & (CAP_DAC_OVERRIDE | CAP_DAC_READ_SEARCH))
+        except (KeyError, IndexError, ValueError):
+            pass
+    else:
+        launch = parse_conf(os.path.join(home, "etc", "splunk-launch.conf")).get("default", {})
+        try:
+            name = launch.get("SPLUNK_OS_USER")
+            pw = pwd.getpwnam(name) if name else pwd.getpwuid(os.stat(os.path.join(home, "etc")).st_uid)
+            uf["uid"] = pw.pw_uid
+            uf["gids"] = {pw.pw_gid} | {g.gr_gid for g in grp.getgrall() if pw.pw_name in g.gr_mem}
+        except (KeyError, OSError):
+            pass
+        caps = uf["unit_props"].get("AmbientCapabilities", "").lower()
+        uf["read_all"] = "cap_dac_read_search" in caps or "cap_dac_override" in caps
+    if uf["uid"] is not None:
+        uf["user"] = user_name(uf["uid"])
+
+    deploy, _ = splunk_conf(home, "deploymentclient")
+    uf["deployment_server"] = deploy.get("target-broker:deploymentServer", {}).get("targetUri")
+    log_dir = os.path.join(home, "var", "log", "splunk")
+    uf["splunkd"] = read_splunk_log(os.path.join(log_dir, "splunkd.log"), args.splunk_window)
+    uf["metrics"] = read_splunk_log(os.path.join(log_dir, "metrics.log"), args.splunk_window)
+    return uf
+
+
+def check_uf_process(uf, args):
+    if not uf["installed"] and not uf["pids"]:
+        return result("uf_process", CRIT, "The Splunk Universal Forwarder isn't installed "
+                      "(%s not found)" % uf["home"],
+                      advice=["Install it, pass --splunk-home if it lives elsewhere, or use "
+                              "--no-splunk on hosts that don't forward to Splunk."])
+    what = ("%s %s" % (uf["product"], uf["version"] or "")).strip()
+    f, notes = Findings(), []
+    if not uf["pids"]:
+        start = ("systemctl start %s" % uf["unit"]) if uf["unit"] else "%s/bin/splunk start" % uf["home"]
+        summary = "%s installed in %s" % (what, uf["home"])
+        f.add(CRIT, "splunkd isn't running, so nothing is being forwarded to Splunk.",
+              "Start it (%s), then check %s/var/log/splunk/splunkd.log if it doesn't stay up."
+              % (start, uf["home"]))
+    else:
+        up = proc_uptime(uf["main"])
+        summary = "%s running as %s (PID %d)" % (what, uf["user"], uf["main"])
+        if up is not None:
+            summary += ", up %s" % fmt_duration(up)
+            if up < args.min_uptime:
+                f.add(WARN, "splunkd restarted %s." % ago(up),
+                      "If this keeps happening, look for crashes in %s/var/log/splunk/splunkd.log."
+                      % uf["home"])
+        if uf["uid"] == 0:
+            notes.append("It runs as root; Splunk recommends a dedicated least-privilege user "
+                         "such as splunkfwd.")
+    if uf["unit"] and uf["unit_props"].get("UnitFileState") == "disabled":
+        f.add(WARN, "%s is disabled, so the forwarder won't start after a reboot." % uf["unit"],
+              "Enable it with: systemctl enable %s" % uf["unit"])
+    elif not uf["unit"] and not os.path.exists("/etc/init.d/splunk"):
+        notes.append("No boot-start service was found, so it may not start after a reboot "
+                     "(see `splunk enable boot-start`).")
+    if uf["deployment_server"]:
+        notes.append("Managed by deployment server %s." % uf["deployment_server"])
+    return result("uf_process", f.status, summary, f.issues, f.advice, notes, home=uf["home"],
+                  version=uf["version"], pids=uf["pids"], user=uf["user"], unit=uf["unit"],
+                  can_read_all_files=uf["read_all"], deployment_server=uf["deployment_server"])
+
+
+def split_hostport(text):
+    m = re.match(r"^\[?([^\]\s]+?)\]?:(\d+)$", text.strip())
+    return (m.group(1), int(m.group(2))) if m else (None, None)
+
+
+def forward_destinations(home):
+    """Receivers from outputs.conf: (destinations, indexer-discovery groups, groups without useACK)."""
+    outputs, _ = splunk_conf(home, "outputs")
+    tcpout = outputs.get("tcpout", {})
+    dests, discovery, no_ack = [], [], []
+    if not conf_true(tcpout.get("disabled", "false")):
+        groups = [g.strip() for g in tcpout.get("defaultGroup", "").split(",") if g.strip()]
+        groups = groups or [s.split(":", 1)[1] for s in outputs if s.startswith("tcpout:")]
+        for group in groups:
+            stanza = outputs.get("tcpout:%s" % group, {})
+            if conf_true(stanza.get("disabled", "false")):
+                continue
+            if stanza.get("indexerDiscovery"):
+                discovery.append(group)
+            if not conf_true(stanza.get("useACK", tcpout.get("useACK", "false"))):
+                no_ack.append(group)
+            for server in stanza.get("server", "").split(","):
+                host, port = split_hostport(server)
+                if host:
+                    dests.append({"host": host, "port": port, "group": group})
+    httpout = outputs.get("httpout", {})
+    if httpout.get("uri") and not conf_true(httpout.get("disabled", "false")):
+        uri = urlsplit(httpout["uri"])
+        if uri.hostname:
+            dests.append({"host": uri.hostname, "group": "httpout",
+                          "port": uri.port or (443 if uri.scheme == "https" else 80)})
+    return dests, discovery, no_ack
+
+
+def decode_proc_ip(hexaddr):
+    raw = bytes.fromhex(hexaddr)
+    if len(raw) == 4:
+        return socket.inet_ntop(socket.AF_INET, raw[::-1])
+    # IPv6 is four 32-bit words, each in host (little-endian) byte order
+    raw = b"".join(raw[i:i + 4][::-1] for i in range(0, 16, 4))
+    addr = socket.inet_ntop(socket.AF_INET6, raw)
+    return addr[7:] if addr.startswith("::ffff:") and "." in addr else addr
+
+
+def process_connections(pids):
+    """Established TCP connections {(remote_ip, remote_port)} owned by the given processes."""
+    inodes = set()
+    for pid in pids:
+        try:
+            fds = os.listdir("/proc/%d/fd" % pid)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink("/proc/%d/fd/%s" % (pid, fd))
+            except OSError:
+                continue
+            if link.startswith("socket:["):
+                inodes.add(link[8:-1])
+    conns = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        for line in (read_text(path) or "").splitlines()[1:]:
+            parts = line.split()
+            if len(parts) > 9 and parts[3] == "01" and parts[9] in inodes:   # 01 = ESTABLISHED
+                ip_hex, port_hex = parts[2].split(":")
+                conns.add((decode_proc_ip(ip_hex), int(port_hex, 16)))
+    return conns
+
+
+def resolve(host):
+    try:
+        return {ai[4][0] for ai in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)}
+    except (socket.gaierror, UnicodeError):
+        return None
+
+
+def check_uf_outputs(uf, args):
+    dests, discovery, no_ack = forward_destinations(uf["home"])
+    if not dests and not discovery:
+        return result("uf_outputs", CRIT, "outputs.conf has no forwarding destination, so nothing "
+                      "leaves this host", advice=["Configure outputs.conf, or check that the "
+                                                  "deployment server has pushed your outputs app."])
+    if not uf["pids"]:
+        return result("uf_outputs", SKIP, "Can't check connections while splunkd is stopped")
+    if os.geteuid() != 0 and os.geteuid() != uf["uid"]:
+        return result("uf_outputs", UNKNOWN, "Can't see splunkd's network connections without root",
+                      advice=["Re-run with sudo."])
+    conns = process_connections(uf["pids"])
+    f, notes, connected, unresolved = Findings(), [], [], []
+    for d in dests:
+        ips = resolve(d["host"])
+        if ips is None:
+            unresolved.append(d["host"])
+        elif any((ip, d["port"]) in conns for ip in ips):
+            connected.append("%s:%d" % (d["host"], d["port"]))
+    if discovery:   # receivers come from the cluster manager; count non-management connections
+        connected += ["%s:%d" % c for c in sorted(conns) if c[1] != 8089
+                      and "%s:%d" % c not in connected]
+    if unresolved:
+        f.add(WARN, "Can't resolve %s, so the forwarder can't reach %s."
+              % (", ".join(unresolved), "it" if len(unresolved) == 1 else "them"),
+              "Check DNS on this host, or use IP addresses in outputs.conf.")
+    last_sent = None
+    for when, _, _, msg in uf["metrics"] or []:
+        if "group=tcpout_connections" in msg:
+            last_sent = when
+    if not connected:
+        since = (datetime.now(timezone.utc) - last_sent).total_seconds() if last_sent else None
+        ports = ", ".join(sorted({str(d["port"]) for d in dests})) or "their receiving port"
+        if since is not None and since < 300:
+            f.add(WARN, "No open connection to an indexer right now, but metrics.log shows data "
+                        "sent %s." % ago(since),
+                  "Probably a reconnect between load-balanced indexers - re-check shortly.")
+        else:
+            f.add(CRIT, "The forwarder isn't connected to any of its receivers, so data is "
+                        "piling up on this host.",
+                  "Check the indexers are up and listening on %s, and that firewalls allow this "
+                  "host; TcpOutputProc lines in splunkd.log give the reason." % ports)
+    summary = ("Connected to %s" % ", ".join(connected)) if connected else "Not connected"
+    summary += "; %s configured" % plural(len(dests), "receiver") if dests else ""
+    if discovery:
+        summary += " (indexer discovery via %s)" % ", ".join(discovery)
+    if no_ack:
+        notes.append("useACK is off for %s, so events in flight can be lost if an indexer restarts."
+                     % ", ".join(no_ack))
+    return result("uf_outputs", f.status, summary, f.issues, f.advice, notes,
+                  receivers=["%s:%s" % (d["host"], d["port"]) for d in dests],
+                  connections=sorted("%s:%d" % c for c in conns), indexer_discovery=discovery)
+
+
+def check_uf_queues(uf, args):
+    metrics = uf["metrics"]
+    window = span(args.splunk_window * 60)
+    if metrics is None:
+        return result("uf_queues", UNKNOWN, "Can't read metrics.log", advice=["Re-run with sudo."])
+    if not uf["pids"]:
+        return result("uf_queues", SKIP, "splunkd isn't running")
+    queues, blocked, kbps = {}, collections.Counter(), []
+    for _, _, _, msg in metrics:
+        if "group=queue" not in msg and "group=thruput" not in msg:
+            continue
+        kv = {k: v.strip('"') for k, v in METRIC_KV_RE.findall(msg)}
+        if kv.get("group") == "queue" and kv.get("name"):
+            try:
+                fill = float(kv["current_size_kb"]) * 100.0 / float(kv["max_size_kb"])
+            except (KeyError, ValueError, ZeroDivisionError):
+                fill = None
+            is_blocked = kv.get("blocked") == "true"
+            queues[kv["name"]] = (fill, is_blocked)        # the latest sample wins
+            if is_blocked:
+                blocked[kv["name"]] += 1
+        elif kv.get("group") == "thruput" and kv.get("name") == "thruput":
+            try:
+                kbps.append(float(kv["instantaneous_kbps"]))
+            except (KeyError, ValueError):
+                pass
+    if not queues and not kbps:
+        return result("uf_queues", WARN, "No metrics in the last %s" % window,
+                      ["splunkd normally writes metrics.log every 30 seconds, so it may be hung."],
+                      ["Restart the forwarder and check splunkd.log."])
+    f = Findings()
+    backlog = "Usually the indexers aren't accepting data or the connection is failing - see the " \
+              "forwarding and splunkd.log checks."
+    for name, (fill, now_blocked) in sorted(queues.items()):
+        if now_blocked:
+            f.add(CRIT, "The %s queue is blocked right now, so data is backing up on this host." % name, backlog)
+        elif blocked[name]:
+            f.add(WARN, "The %s queue was blocked %s in the last %s." % (name, times(blocked[name]), window), backlog)
+        elif fill is not None and fill >= args.splunk_queue_warn:
+            f.add(WARN, "The %s queue is %.0f%% full." % (name, fill), backlog)
+    limits, _ = splunk_conf(uf["home"], "limits")
+    try:
+        max_kbps = float(limits.get("thruput", {}).get("maxKBps", "0"))
+    except ValueError:
+        max_kbps = 0.0
+    avg = sum(kbps) / len(kbps) if kbps else 0.0
+    if max_kbps > 0 and kbps and avg >= max_kbps * 0.9:
+        f.add(WARN, "Throughput averages %.0f KB/s against a maxKBps limit of %.0f KB/s, so the "
+                    "forwarder is being throttled and falling behind." % (avg, max_kbps),
+              "Raise [thruput] maxKBps in limits.conf on this forwarder (0 means unlimited), e.g. "
+              "through the deployment server.")
+    summary = "Throughput %.1f KB/s on average (limit %s)" % (
+        avg, "%.0f KB/s" % max_kbps if max_kbps > 0 else "none")
+    fullest = max(((n, v[0]) for n, v in queues.items() if v[0] is not None),
+                  key=lambda item: item[1], default=None)
+    if fullest:
+        summary += "; fullest queue is %s at %.0f%%" % fullest
+    return result("uf_queues", f.status, summary, f.issues, f.advice,
+                  queue_fill_pct={n: round(v[0], 1) for n, v in queues.items() if v[0] is not None},
+                  blocked_samples=dict(blocked), avg_kbps=round(avg, 1), max_kbps=max_kbps)
+
+
+def monitor_covers(spec, settings, target):
+    """Would [monitor://spec] (with its whitelist/blacklist/recursive settings) read `target`?"""
+    spec = spec.rstrip("/") or "/"
+    candidates = {target, os.path.realpath(target)}
+    if "*" in spec or "..." in spec:
+        # Splunk wildcards: "..." recurses through directories, "*" stays within one segment
+        rx = re.escape(spec).replace(re.escape("..."), ".*").replace(re.escape("*"), "[^/]*")
+        hit = any(re.fullmatch(rx + "(/.*)?", c) for c in candidates)
+    else:
+        specs = {spec, os.path.realpath(spec)}
+        hit = False
+        for c in candidates:
+            for s in specs:
+                if c == s:
+                    hit = True
+                elif c.startswith(s + "/"):
+                    top_level = os.path.dirname(c) == s
+                    hit = hit or top_level or conf_true(settings.get("recursive", "true"))
+    if not hit:
+        return False
+    if settings.get("whitelist") and not any(re.search(settings["whitelist"], c) for c in candidates):
+        return False
+    if settings.get("blacklist") and any(re.search(settings["blacklist"], c) for c in candidates):
+        return False
+    return True
+
+
+def uf_read_blocker(uf, path):
+    """None if the forwarder's user can read `path`, else (blocking path, stat, has_acl, group bit
+    that would grant access). Standard permission bits only; ACLs are flagged, not evaluated."""
+    uid, gids = uf["uid"], uf["gids"]
+    if uid is None or uid == 0 or uf["read_all"]:
+        return None
+    path = os.path.realpath(path)
+    parts = path.split("/")
+    steps = [("/".join(parts[:i]) or "/", stat.S_IXUSR, stat.S_IXGRP, stat.S_IXOTH)
+             for i in range(1, len(parts))]
+    steps.append((path, stat.S_IRUSR, stat.S_IRGRP, stat.S_IROTH))
+    for p, owner_bit, group_bit, other_bit in steps:
+        try:
+            st = os.stat(p)
+        except OSError:
+            return None
+        if st.st_uid == uid:
+            ok = st.st_mode & owner_bit
+        elif st.st_gid in gids:
+            ok = st.st_mode & group_bit
+        else:
+            ok = st.st_mode & other_bit
+        if not ok:
+            try:
+                has_acl = "system.posix_acl_access" in os.listxattr(p)
+            except OSError:
+                has_acl = False
+            return p, st, has_acl, group_bit
+    return None
+
+
+def covering_stanzas(uf, target):
+    inputs, origin = splunk_conf(uf["home"], "inputs")
+    covering = [(stanza, settings) for stanza, settings in inputs.items()
+                if stanza.startswith("monitor://") and not conf_true(settings.get("disabled", "false"))
+                and monitor_covers(stanza[len("monitor://"):], settings, target)]
+    return covering, inputs, origin
+
+
+def check_uf_input(uf, target, args):
+    name = "uf_input:%s" % os.path.basename(target)
+    if not os.path.exists(target):
+        return result(name, SKIP, "%s doesn't exist yet" % target)
+    covering, inputs, origin = covering_stanzas(uf, target)
+    f, notes = Findings(), []
+    if not covering:
+        f.add(WARN, "Nothing in inputs.conf monitors %s, so it never reaches Splunk." % target,
+              "Add a [monitor://%s] stanza with the right index and sourcetype, or check the "
+              "deployment server pushed your inputs app." % os.path.dirname(target))
+        return result(name, f.status, "Not forwarded", f.issues, f.advice, path=target)
+
+    stanza, settings = covering[0]
+    index = settings.get("index") or inputs.get("default", {}).get("index")
+    labels = (["index=%s" % index] if index else []) + (
+        ["sourcetype=%s" % settings["sourcetype"]] if settings.get("sourcetype") else [])
+    summary = "Monitored by [%s]%s" % (stanza, " (%s)" % ", ".join(labels) if labels else "")
+    if not index:
+        notes.append("No index is set, so these events land in the default index (main).")
+
+    blocker = uf_read_blocker(uf, target)
+    if blocker:
+        where, st, has_acl, group_bit = blocker
+        user, group = uf["user"], group_name(st.st_gid)
+        issue = "The forwarder runs as %s, which can't read it (blocked at %s: mode %o, %s:%s)." % (
+            user, where, st.st_mode & 0o777, user_name(st.st_uid), group)
+        if has_acl:
+            f.add(WARN, issue + " That path has a POSIX ACL which may allow access - check with getfacl.")
+        elif st.st_mode & group_bit and st.st_gid != 0:
+            f.add(CRIT, issue, "Add %s to the %s group (usermod -aG %s %s) and restart the forwarder."
+                  % (user, group, group, user))
+        else:
+            f.add(CRIT, issue, "Grant access with an ACL, e.g. setfacl -R -m u:%s:rX %s, then "
+                  "restart the forwarder." % (user, os.path.dirname(os.path.realpath(target))))
+    elif uf["read_all"] and uf["uid"] not in (0, None):
+        summary += ", readable (splunkd has CAP_DAC_READ_SEARCH)"
+    elif uf["uid"] not in (0, None):
+        summary += ", readable by %s" % uf["user"]
+
+    complaints = [(comp, msg) for _, level, comp, msg in uf["splunkd"] or []
+                  if level in ("WARN", "WARNING", "ERROR") and target in msg]
+    if complaints:
+        comp, msg = complaints[-1]
+        f.add(WARN, "splunkd.log complained about this file %s in the last %s, most recently: %s: %s"
+              % (times(len(complaints)), span(args.splunk_window * 60), comp, msg[:200]))
+    return result(name, f.status, summary, f.issues, f.advice, notes, path=target, stanza=stanza,
+                  defined_in=origin.get(stanza))
+
+
+def check_uf_log(uf, args):
+    entries = uf["splunkd"]
+    window = span(args.splunk_window * 60)
+    if entries is None:
+        return result("uf_log", UNKNOWN, "Can't read splunkd.log", advice=["Re-run with sudo."])
+    counts, issues, grouped = collections.Counter(), collections.Counter(), {}
+    for _, level, comp, msg in entries:
+        level = "WARN" if level.startswith("WARN") else "ERROR" if level in ("ERROR", "FATAL", "CRIT") else level
+        counts[level] += 1
+        if level in ("WARN", "ERROR"):
+            text = "%s %s" % (comp, msg)
+            for i, (pattern, _, _) in enumerate(UF_KNOWN_ISSUES):
+                if pattern.search(text):
+                    issues[i] += 1
+        if level == "ERROR":
+            entry = grouped.setdefault("%s: %s" % (comp, re.sub(r"\d+", "N", msg)[:200]), [0, ""])
+            entry[0] += 1
+            entry[1] = "%s: %s" % (comp, msg)
+    f = Findings()
+    for i, n in sorted(issues.items()):
+        _, meaning, fix = UF_KNOWN_ISSUES[i]
+        f.add(WARN, "%s (%s in the last %s)." % (meaning, times(n), window), fix)
+    if args.splunk_error_warn and counts["ERROR"] >= args.splunk_error_warn:
+        f.add(WARN, "%s logged in the last %s." % (plural(counts["ERROR"], "error"), window),
+              "Check splunkd.log around those times for context.")
+    top = sorted(grouped.values(), key=lambda e: -e[0])[:3]
+    summary = "In the last %s: %s, %s" % (window, plural(counts["ERROR"], "error"),
+                                          plural(counts["WARN"], "warning"))
+    return result("uf_log", f.status, summary, f.issues, f.advice,
+                  examples=["(%dx) %s" % (c, t[:220]) for c, t in top] if f.status != OK else (),
+                  counts=dict(counts), top_errors=[{"count": c, "latest": t} for c, t in top])
+
+
+def splunk_checks(args, target_groups, product_disk_path, no_target_reason=None):
+    """All forwarder checks. `target_groups` lists files this host produces that must reach
+    Splunk; each group is a list of alternatives (e.g. alerts.json or alerts.log), and the
+    first one that's monitored is the one checked."""
+    uf = discover_splunk(args)
+    results = safe("uf_process", check_uf_process, uf, args)
+    if not uf["installed"] and not uf["pids"]:
+        return results
+    results += safe("uf_outputs", check_uf_outputs, uf, args)
+    results += safe("uf_queues", check_uf_queues, uf, args)
+    for group in target_groups:
+        group = [p for p in group if os.path.exists(p)] or group[:1]
+        chosen = next((p for p in group if covering_stanzas(uf, p)[0]), group[0])
+        results += safe("uf_input", check_uf_input, uf, chosen, args)
+    if not target_groups and no_target_reason:
+        results.append(result("uf_input", SKIP, no_target_reason))
+    results += safe("uf_log", check_uf_log, uf, args)
+    try:
+        if os.stat(existing_parent(uf["home"])).st_dev != os.stat(existing_parent(product_disk_path)).st_dev:
+            results += safe("uf_disk", check_disk, uf["home"], args.disk_warn, args.disk_crit,
+                            "Free space under %s (old files in var/log/splunk, or a large fishbucket)."
+                            % uf["home"], "uf_disk")
+    except OSError:
+        pass
+    return results
+
+
+def add_splunk_args(parser):
+    s = parser.add_argument_group("Splunk Universal Forwarder")
+    s.add_argument("--no-splunk", action="store_true", help="skip the Splunk forwarder checks")
+    s.add_argument("--splunk-home",
+                   help="forwarder install dir (default: from the running splunkd, else $SPLUNK_HOME, "
+                        "else /opt/splunkforwarder)")
+    s.add_argument("--splunk-expect", action="append", metavar="PATH",
+                   help="another file that must be forwarded to Splunk (repeatable)")
+    s.add_argument("--splunk-window", type=int, default=60,
+                   help="minutes of splunkd.log and metrics.log to examine (default %(default)s)")
+    s.add_argument("--splunk-queue-warn", type=float, default=80,
+                   help="warn when a forwarder queue is N%% full (default %(default)s)")
+    s.add_argument("--splunk-error-warn", type=int, default=10,
+                   help="warn at N or more ERROR lines in splunkd.log in the window, 0 disables "
+                        "(default %(default)s)")
+
+
+# --------------------------------------------------------------------------- #
 # Output
 # --------------------------------------------------------------------------- #
 
@@ -860,7 +1511,8 @@ def render_human(results, overall, host, args):
     if not tally:
         tally.append("%s passed" % plural(len(healthy), "check"))
 
-    print(paint("1", "%s health check%s%s%s%s" % (PRODUCT, sep, host, sep,
+    label = PRODUCT + (" + Splunk forwarder" if any(r["check"].startswith("uf_") for r in results) else "")
+    print(paint("1", "%s health check%s%s%s%s" % (label, sep, host, sep,
                                                   datetime.now().strftime("%a %d %b %Y, %H:%M"))))
     print()
     print("%s %s - %s" % (paint(COLORS[overall], sym[overall]),
@@ -964,6 +1616,8 @@ def parse_args():
     t.add_argument("--disk-warn", type=float, default=80, help="disk/inode %% warning (default %(default)s)")
     t.add_argument("--disk-crit", type=float, default=90, help="disk/inode %% critical (default %(default)s)")
 
+    add_splunk_args(p)
+
     o = p.add_argument_group("output and options")
     o.add_argument("--validate-config", action="store_true",
                    help="also run each daemon's -t config test and verify-agent-conf")
@@ -1005,8 +1659,21 @@ def main():
                         "Clean up old alerts and archives under logs/, and check the retention job.")
         if args.validate_config:
             results += safe("config_test", check_config_test, ctx, args)
+    if not args.no_splunk:
+        groups = []
+        if ctx["mode"] in ("server", "local"):
+            alerts_dir = os.path.join(ctx["home"], "logs", "alerts")
+            groups.append([os.path.join(alerts_dir, "alerts.json"), os.path.join(alerts_dir, "alerts.log")])
+        groups += [[p] for p in args.splunk_expect or []]
+        results += splunk_checks(args, groups, ctx["home"],
+                                 "OSSEC agents send events to the OSSEC server rather than Splunk "
+                                 "- pass --splunk-expect to check other files")
     return report(results, args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:                 # e.g. piped into `head`, which stopped reading
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(3)
